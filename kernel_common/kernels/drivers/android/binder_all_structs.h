@@ -18,7 +18,7 @@
  * 便于通读、对照和理解驱动的对象模型与锁/生命周期关系。
  * ==================================================================
  *
- * 来源（Android 通用内核 android14-6.1）：
+ * 来源（Android 通用内核 ）：
  *   kernel_common/kernels/drivers/android/binder_internal.h
  *   kernel_common/kernels/drivers/android/binder_alloc.h
  *   kernel_common/kernels/drivers/android/dbitmap.h
