@@ -18,7 +18,14 @@
  * 便于通读、对照和理解驱动的对象模型与锁/生命周期关系。
  * ==================================================================
  *
- * 来源（Android 通用内核 ）：
+ * 来源（Android android-mainline GKI 分支，Linux 6.15 "Baby Opossum Posse"）：
+ *   版本依据（2026-09-03 核对）：
+ *     kernel_common/kernels/Makefile:2-6
+ *       VERSION = 6 / PATCHLEVEL = 15 / SUBLEVEL = 0 / NAME = "Baby Opossum Posse"
+ *     kernel_common/kernels/build.config.constants:1
+ *       BRANCH=android-mainline
+ *   注意：本文件**不是** android14-6.1，勿与旧版 AOSP 内核的行号/实现混用。
+ *
  *   kernel_common/kernels/drivers/android/binder_internal.h
  *   kernel_common/kernels/drivers/android/binder_alloc.h
  *   kernel_common/kernels/drivers/android/dbitmap.h
