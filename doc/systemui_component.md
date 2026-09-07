@@ -250,3 +250,119 @@ default void onBootCompleted() {
 第一行 `onContextAvailable` = **建图**:懒执行 `SystemUIInitializerImpl.init(false)`,一次性把 `GlobalRootComponent → WMComponent → SysUIComponent` 三层 Dagger 图连同 `Dependency` 全部 build 起来,返回初始化器句柄;第二行 `getSysUIComponent` = **取组件**:拿到 `@SysUISingleton` 子组件引用,作为后续一切单例与 Startable 的入口;第三行 `provideBootCacheImpl` = **取单例**:从组件里拉出唯一的 `BootCompleteCacheImpl`,Application 自己留着它,用来在 `LOCKED_BOOT_COMPLETED` 广播到达时调用 `setBootComplete()`,从而唤醒 `PhoneStateMonitor`、`LocationControllerImpl` 等一批等待开机完成的 SysUI 组件。
 
 踩坑点提示:SystemUIApplication 是系统框架创建的、游离于 Dagger 图之外,所以这三行手工接线是"框架对象"与"图内单例"之间唯一的桥;`provideBootCacheImpl()` 若被误改成普通 `new BootCompleteCacheImpl(...)`,广播置位将永远无法传导给注入的消费方,开机后一批组件会停在等待态——这也是把该方法定义为 `@SysUISingleton` provision、而不是简单构造器的根本原因。
+
+
+
+按 AOSP 技能约定:大流程先用 Mermaid 总览。下面分两张图给你:**调用时序图**(谁在何时调谁,含返回链)和**第三行的对象依赖图**(为什么能拿到同一单例)。
+
+## 图一:三行代码所在的完整调用时序图
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant AT as ActivityThread
+    participant F as PhoneSystemUIAppComponentFactory<br/>(SystemUIAppComponentFactoryBase)
+    participant App as SystemUIApplication
+    participant CB as ContextAvailableCallback<br/>(onCreate 里的 lambda)
+    participant Init as SystemUIInitializerImpl<br/>(SystemUIInitializer)
+    participant RC as DaggerReferenceGlobalRootComponent
+    participant WM as DaggerWMComponent
+    participant SUI as DaggerReferenceSysUIComponent
+    participant Dep as Dependency
+    participant BCC as BootCompleteCacheImpl
+    participant Svc as SystemUIService
+    participant AMS as ActivityManagerService
+
+    AMS->>AT: startSystemUi: 启动 .SystemUIService
+    AT->>F: instantiateApplicationCompat()<br/>[清单 appComponentFactory]
+    F->>App: new SystemUIApplication()<br/>裸构造(无 DI)
+    F->>App: setContextAvailableCallback(cb)<br/>把 lambda 存进 mContextAvailableCallback
+    AT->>App: callApplicationOnCreate → onCreate()
+    Note over App: ─── 代码第 110 行开始 ───
+    App->>CB: mInitializer = mContextAvailableCallback.onContextAvailable(this)
+    CB->>Init: createSystemUIInitializer → new SystemUIInitializerImpl(ctx)
+    CB->>Init: initializer.init(false)
+    Init->>RC: builder().context(ctx).instrumentationTest(false).build()
+    RC-->>Init: mRootComponent
+    Init->>WM: setupWmComponent(): wmBuilder.build()<br/>[启 shell 主线程, runWithScissors]
+    WM-->>Init: mWMComponent
+    Init->>SUI: getSysUIComponent()<br/>.setShell/.setPip/...12 个 @BindsInstance
+    SUI-->>Init: mSysUIComponent = builder.build()
+    Init->>Dep: mSysUIComponent.createDependency().start()
+    CB->>SUI: sysUIComponent.inject(factory)
+    CB-->>App: 返回 initializer (= mInitializer)
+    Note over App: ─── 代码第 111 行 ───
+    App->>Init: mSysUIComponent = mInitializer.getSysUIComponent()
+    Init-->>App: SysUIComponent 子组件引用
+    Note over App: ─── 代码第 112 行 ───
+    App->>SUI: mBootCompleteCache = mSysUIComponent.provideBootCacheImpl()
+    SUI-->>App: BootCompleteCacheImpl(@SysUISingleton 唯一实例)
+    Note over App: onCreate 尾部
+    App->>App: 注册 ACTION_LOCKED_BOOT_COMPLETED<br/>SYSTEM_HIGH_PRIORITY 广播接收器
+    Note over App: ─── onCreate 之后(SystemUIService 拉起)───
+    AT->>Svc: bindService → onCreate()
+    Svc->>App: ((SystemUIApplication)getApplication()).startSystemUserServicesIfNeeded()
+    App->>BCC: mBootCompleteCache.isBootComplete()
+    App->>BCC: 若 sys.boot_completed==1 → setBootComplete()
+    AMS-->>App: 广播 LOCKED_BOOT_COMPLETED
+    App->>BCC: mBootCompleteCache.setBootComplete()<br/>[compareAndSet + 唤醒全部 listener]
+    App->>App: notifyBootCompleted(各 CoreStartable)
+```
+
+对应源码锚点(前三行):
+- 第 110 行 `SystemUIApplication.java:110`,其实现体在 `SystemUIAppComponentFactoryBase.kt:62-79` + `SystemUIInitializer.java:73-132`
+- 第 111 行 `SystemUIApplication.java:111` → `SystemUIInitializer.java:173-175`
+- 第 112 行 `SystemUIApplication.java:112` → `SysUIComponent.java:123-124`
+
+## 图二:三行代码之间的“调用-返回-状态”关系图(带返回值)
+
+```mermaid
+graph LR
+    subgraph onCreate["SystemUIApplication.onCreate()"]
+        L110["① mInitializer =<br/>mContextAvailableCallback.onContextAvailable(this)"]
+        L111["② mSysUIComponent =<br/>mInitializer.getSysUIComponent()"]
+        L112["③ mBootCompleteCache =<br/>mSysUIComponent.provideBootCacheImpl()"]
+    end
+
+    L110 -->|"触发建图 lambda"| CBF["createSystemUIInitializerInternal<br/>SystemUIAppComponentFactoryBase.kt:62"]
+    CBF -->|"new + init(false)"| INIT["SystemUIInitializerImpl<br/>(持有三层图)"]
+    INIT --> GRC["GlobalRootComponent"]
+    INIT --> WM["WMComponent"]
+    INIT --> SUI["SysUIComponent"]
+    SUI --> DEP["Dependency.start()"]
+    CBF -->|"sysUIComponent.inject(factory)"| SUI
+    CBF -. "返回值 Initializer" .-> L110
+
+    L110 -->|"保存句柄"| MI["mInitializer 字段"]
+    MI -->|"getSysUIComponent() 只取字段"| L111
+    SUI -. "②返回值 SysUIComponent" .-> L111
+
+    L111 -->|"组件引用"| MS["mSysUIComponent 字段"]
+    MS -->|"③ provision 方法"| L112
+    SUI -. "@SysUISingleton 提供" .-> BCC["BootCompleteCacheImpl<br/>BootCompleteCacheImpl.kt:35"]
+    L112 -. "③返回值(唯一单例)" .-> MB["mBootCompleteCache 字段"]
+
+    BCC -->|"注册 dumpable"| DM["DumpManager"]
+    BCC -. "同一实例被注入" .-> PH["PhoneStateMonitor"]
+    BCC -. "同一实例被注入" .-> LOC["LocationControllerImpl"]
+    MB -->|"setBootComplete()"| BCC
+```
+
+## 图三:第三行的对象归属(为什么两次拿到的都是同一个对象)
+
+```mermaid
+flowchart TD
+    subgraph dagger["SysUIComponent 作用域(@SysUISingleton)"]
+        CACHE["BootCompleteCacheImpl 实例<br/>字段: AtomicBoolean bootComplete<br/>+ WeakReference 监听器列表"]
+        PROV["provideBootCacheImpl()<br/>← provision 方法,<br/>返回组件内缓存的单例"]
+    end
+    APP["SystemUIApplication<br/>(框架创建,图外)"] -->|"111→② getSysUIComponent"| PROV
+    PROV -->|"③ 同一引用"| APP
+    APP -->|"广播到达时 setBootComplete()"| CACHE
+    E1["注入点: PhoneStateMonitor"] -.成员注入.-> CACHE
+    E2["注入点: LocationControllerImpl"] -.成员注入.-> CACHE
+    CACHE -->|"onBootComplete() 唤醒"| E1
+    CACHE -->|"onBootComplete() 唤醒"| E2
+```
+
+要点:图三想表达的是 —— SystemUIApplication 游离在 Dagger 图之外,无法用 `@Inject` 拿依赖,所以第 111 行先取组件、第 112 行再借 `@SysUISingleton` 的 provision 方法手动从图里"拔出" `BootCompleteCacheImpl`;正因为是作用域单例,Application 手里这份和图内注入给 `PhoneStateMonitor`、`LocationControllerImpl` 等消费方的**是同一内存对象**,Application 侧的 `setBootComplete()` 才能跨对象生效。
