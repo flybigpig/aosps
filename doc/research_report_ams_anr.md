@@ -235,6 +235,304 @@ Android 15 把「进程启动」拆成了软硬两级超时：`PROC_START_TIMEOU
 | App 启动超时 | `bindApplication` 未完成 | 15s | `AMS.BIND_APPLICATION_TIMEOUT` (577) | `handleBindApplicationTimeoutHard` (5108) |
 | 应用自报 | App 主动调用 | N/A | — | `AMS.appNotResponding` (7066) |
 
+### 3.8 输入 ANR 全链路精校（native → JNI → Java → AMS）
+
+本节对 3.1 做端到端精校。native 侧源码位于 `platform_frameworks_native/services/inputflinger/dispatcher/InputDispatcher.cpp`（本工作区已检出，下文行号均指该文件），Java 侧行号仍相对 `framework15`。
+
+#### 3.8.1 native 层：InputDispatcher
+
+`dispatchOnce()` 每次循环末尾都会调用 `processAnrsLocked()`，并把返回值作为下一次唤醒时间——ANR 检测是**驱动 Looper 唤醒时刻的**，不是独立线程轮询：
+
+```1006:1027:platform_frameworks_native/services/inputflinger/dispatcher/InputDispatcher.cpp
+void InputDispatcher::dispatchOnce() {
+    nsecs_t nextWakeupTime = LLONG_MAX;
+    { // acquire lock
+        std::scoped_lock _l(mLock);
+        mDispatcherIsAlive.notify_all();
+
+        // Run a dispatch loop if there are no pending commands.
+        // The dispatch loop might enqueue commands to run afterwards.
+        if (!haveCommandsLocked()) {
+            dispatchOnceInnerLocked(/*byref*/ nextWakeupTime);
+        }
+
+        // Run all pending commands if there are any.
+        // If any commands were run then force the next poll to wake up immediately.
+        if (runCommandsLockedInterruptable()) {
+            nextWakeupTime = LLONG_MIN;
+        }
+
+        // If we are still waiting for ack on some events,
+        // we might have to wake up earlier to check if an app is anr'ing.
+        const nsecs_t nextAnrCheck = processAnrsLocked();
+        nextWakeupTime = std::min(nextWakeupTime, nextAnrCheck);
+```
+
+默认超时常量就定义在 native 侧，这修正了前文「未检出 5000ms 定义」的说法：
+
+```138:142:platform_frameworks_native/services/inputflinger/dispatcher/InputDispatcher.cpp
+// Default input dispatching timeout if there is no focused application or paused window
+// from which to determine an appropriate dispatching timeout.
+const std::chrono::duration DEFAULT_INPUT_DISPATCHING_TIMEOUT = std::chrono::milliseconds(
+        android::os::IInputConstants::UNMULTIPLIED_DEFAULT_DISPATCHING_TIMEOUT_MILLIS *
+        HwTimeoutMultiplier());
+```
+
+`processAnrsLocked()` 有两条分支，与用户给出的结构一致，但顺序与细节需注意：
+
+```1078:1110:platform_frameworks_native/services/inputflinger/dispatcher/InputDispatcher.cpp
+nsecs_t InputDispatcher::processAnrsLocked() {
+    const nsecs_t currentTime = now();
+    nsecs_t nextAnrCheck = LLONG_MAX;
+    // Check if we are waiting for a focused window to appear. Raise ANR if waited too long
+    if (mNoFocusedWindowTimeoutTime.has_value() && mAwaitedFocusedApplication != nullptr) {
+        if (currentTime >= *mNoFocusedWindowTimeoutTime) {
+            processNoFocusedWindowAnrLocked();
+            mAwaitedFocusedApplication.reset();
+            mNoFocusedWindowTimeoutTime = std::nullopt;
+            return LLONG_MIN;
+        } else {
+            // Keep waiting. We will drop the event when mNoFocusedWindowTimeoutTime comes.
+            nextAnrCheck = *mNoFocusedWindowTimeoutTime;
+        }
+    }
+
+    // Check if any connection ANRs are due
+    nextAnrCheck = std::min(nextAnrCheck, mAnrTracker.firstTimeout());
+    if (currentTime < nextAnrCheck) { // most likely scenario
+        return nextAnrCheck;          // everything is normal. Let's check again at nextAnrCheck
+    }
+
+    // If we reached here, we have an unresponsive connection.
+    std::shared_ptr<Connection> connection = getConnectionLocked(mAnrTracker.firstToken());
+    if (connection == nullptr) {
+        ALOGE("Could not find connection for entry %" PRId64, mAnrTracker.firstTimeout());
+        return nextAnrCheck;
+    }
+    connection->responsive = false;
+    // Stop waking up for this unresponsive connection
+    mAnrTracker.eraseToken(connection->getToken());
+    onAnrLocked(connection);
+    return LLONG_MIN;
+}
+```
+
+**分支一（无聚焦窗口）**：`mNoFocusedWindowTimeoutTime` 的埋点在 `findFocusedWindowTargetsLocked` 里——发现有 focused application 但没有 focused window 时才启动计时，超时取应用自身可覆盖的 `getDispatchingTimeout(DEFAULT_INPUT_DISPATCHING_TIMEOUT)`：
+
+```2329:2341:platform_frameworks_native/services/inputflinger/dispatcher/InputDispatcher.cpp
+    if (focusedWindowHandle == nullptr && focusedApplicationHandle != nullptr) {
+        if (!mNoFocusedWindowTimeoutTime.has_value()) {
+            // We just discovered that there's no focused window. Start the ANR timer
+            std::chrono::nanoseconds timeout = focusedApplicationHandle->getDispatchingTimeout(
+                    DEFAULT_INPUT_DISPATCHING_TIMEOUT);
+            mNoFocusedWindowTimeoutTime = currentTime + timeout.count();
+            mAwaitedFocusedApplication = focusedApplicationHandle;
+            mAwaitedApplicationDisplayId = displayId;
+            ALOGW("Waiting because no window has focus but %s may eventually add a "
+                  "window when it finishes starting up. Will wait for %" PRId64 "ms",
+                  mAwaitedFocusedApplication->getName().c_str(), millis(timeout));
+            nextWakeupTime = std::min(nextWakeupTime, *mNoFocusedWindowTimeoutTime);
+            return injectionError(InputEventInjectionResult::PENDING);
+```
+
+到期后 `processNoFocusedWindowAnrLocked()` 做**二次校验**（focused app 是否变化、是否已出现 focused window），任一不满足即放弃：
+
+```1052:1070:platform_frameworks_native/services/inputflinger/dispatcher/InputDispatcher.cpp
+void InputDispatcher::processNoFocusedWindowAnrLocked() {
+    // Check if the application that we are waiting for is still focused.
+    std::shared_ptr<InputApplicationHandle> focusedApplication =
+            getValueByKey(mFocusedApplicationHandlesByDisplay, mAwaitedApplicationDisplayId);
+    if (focusedApplication == nullptr ||
+    ...
+            getFocusedWindowHandleLocked(mAwaitedApplicationDisplayId);
+    if (focusedWindowHandle != nullptr) {
+        return; // We now have a focused window. No need for ANR.
+    }
+    onAnrLocked(mAwaitedFocusedApplication);
+}
+```
+
+应用句柄版本的 `onAnrLocked` 通过 `postCommandLocked` 把回调排到命令队列，**在释放 mLock 后**才调策略层：
+
+```6571:6581:platform_frameworks_native/services/inputflinger/dispatcher/InputDispatcher.cpp
+void InputDispatcher::onAnrLocked(std::shared_ptr<InputApplicationHandle> application) {
+    std::string reason =
+            StringPrintf("%s does not have a focused window", application->getName().c_str());
+    updateLastAnrStateLocked(*application, reason);
+
+    auto command = [this, app = std::move(application)]() REQUIRES(mLock) {
+        scoped_unlock unlock(mLock);
+        mPolicy.notifyNoFocusedWindowAnr(app);
+    };
+    postCommandLocked(std::move(command));
+}
+```
+
+**分支二（连接分发超时）**：这是最常见的输入 ANR。三个要点——(1) `waitQueue` 已空则直接放弃上报（应用已恢复）；(2) reason 描述的是 **waitQueue 队首（最老）** 的事件，理由见代码注释：超时时长可能被动态改过，但应用大概率线性处理事件，最老那个最有信息量；(3) 先通知策略层，再 `cancelEventsForAnrLocked` 丢弃后续事件：
+
+```6536:6568:platform_frameworks_native/services/inputflinger/dispatcher/InputDispatcher.cpp
+void InputDispatcher::onAnrLocked(const std::shared_ptr<Connection>& connection) {
+    if (connection == nullptr) {
+        LOG_ALWAYS_FATAL("Caller must check for nullness");
+    }
+    // Since we are allowing the policy to extend the timeout, maybe the waitQueue
+    // is already healthy again. Don't raise ANR in this situation
+    if (connection->waitQueue.empty()) {
+        ALOGI("Not raising ANR because the connection %s has recovered",
+              connection->getInputChannelName().c_str());
+        return;
+    }
+    /**
+     * The "oldestEntry" is the entry that was first sent to the application. That entry, however,
+     * may not be the one that caused the timeout to occur. ...
+     */
+    DispatchEntry& oldestEntry = *connection->waitQueue.front();
+    const nsecs_t currentWait = now() - oldestEntry.deliveryTime;
+    std::string reason =
+            android::base::StringPrintf("%s is not responding. Waited %" PRId64 "ms for %s",
+                                        connection->getInputChannelName().c_str(),
+                                        ns2ms(currentWait),
+                                        oldestEntry.eventEntry->getDescription().c_str());
+    sp<IBinder> connectionToken = connection->getToken();
+    updateLastAnrStateLocked(getWindowHandleLocked(connectionToken), reason);
+
+    processConnectionUnresponsiveLocked(*connection, std::move(reason));
+
+    // Stop waking up for events on this connection, it is already unresponsive
+    cancelEventsForAnrLocked(connection);
+}
+```
+
+`processConnectionUnresponsiveLocked` 负责判断连接是 monitor 还是普通窗口并取出 owner pid，最终同样以命令形式、在解锁后回调策略层：
+
+```6635:6643:platform_frameworks_native/services/inputflinger/dispatcher/InputDispatcher.cpp
+void InputDispatcher::sendWindowUnresponsiveCommandLocked(const sp<IBinder>& token,
+                                                          std::optional<gui::Pid> pid,
+                                                          std::string reason) {
+    auto command = [this, token, pid, r = std::move(reason)]() REQUIRES(mLock) {
+        scoped_unlock unlock(mLock);
+        mPolicy.notifyWindowUnresponsive(token, pid, r);
+    };
+    postCommandLocked(std::move(command));
+}
+```
+
+策略接口定义在 `dispatcher/include/InputDispatcherPolicyInterface.h:46-57`。
+
+#### 3.8.2 JNI → Java：IMS → InputManagerCallback → wm/AnrController
+
+JNI 回调落在 `InputManagerService` 的私有方法上（`@SuppressWarnings("unused")` 即 native 反射调用），注意 pid 参数带 `isPidValid` 标志位，被包装成 `OptionalInt`：
+
+```2315:2334:services/core/java/com/android/server/input/InputManagerService.java
+    // Native callback.
+    @SuppressWarnings("unused")
+    private void notifyNoFocusedWindowAnr(InputApplicationHandle inputApplicationHandle) {
+        mWindowManagerCallbacks.notifyNoFocusedWindowAnr(inputApplicationHandle);
+    }
+
+    // Native callback
+    @SuppressWarnings("unused")
+    private void notifyWindowUnresponsive(IBinder token, int pid, boolean isPidValid,
+            String reason) {
+        mWindowManagerCallbacks.notifyWindowUnresponsive(token,
+                isPidValid ? OptionalInt.of(pid) : OptionalInt.empty(), reason);
+    }
+
+    // Native callback
+    @SuppressWarnings("unused")
+    private void notifyWindowResponsive(IBinder token, int pid, boolean isPidValid) {
+        mWindowManagerCallbacks.notifyWindowResponsive(token,
+                isPidValid ? OptionalInt.of(pid) : OptionalInt.empty());
+    }
+```
+
+实现类 `InputManagerCallback` 的关键动作是**把 String reason 包装成 TimeoutRecord**，因此 wm/AnrController 收到的不是字符串：
+
+```97:115:services/core/java/com/android/server/wm/InputManagerCallback.java
+    @Override
+    public void notifyNoFocusedWindowAnr(@NonNull InputApplicationHandle applicationHandle) {
+        TimeoutRecord timeoutRecord = TimeoutRecord.forInputDispatchNoFocusedWindow(
+                timeoutMessage(OptionalInt.empty(), "Application does not have a focused window"));
+        mService.mAnrController.notifyAppUnresponsive(applicationHandle, timeoutRecord);
+    }
+
+    @Override
+    public void notifyWindowUnresponsive(@NonNull IBinder token, @NonNull OptionalInt pid,
+            String reason) {
+        TimeoutRecord timeoutRecord = TimeoutRecord.forInputDispatchWindowUnresponsive(
+                timeoutMessage(pid, reason));
+        mService.mAnrController.notifyWindowUnresponsive(token, pid, timeoutRecord);
+    }
+```
+
+即：**无聚焦窗口分支走的是 `notifyAppUnresponsive`，不是 `notifyWindowUnresponsive`**——两条 native 分支在 Java 侧对应两个不同入口（详见 3.1 节）。`wm/AnrController` 的 `notifyWindowUnresponsive(token, pid, timeoutRecord)` 在归因后调用 `dumpAnrStateAsync`，该方法**异步投递到 FgThread**，不在当前调用栈上：
+
+```363:376:services/core/java/com/android/server/wm/AnrController.java
+    private void dumpAnrStateAsync(ActivityRecord activity, WindowState windowState,
+            String reason) {
+        FgThread.getExecutor().execute(() -> {
+            try {
+                Trace.traceBegin(Trace.TRACE_TAG_ACTIVITY_MANAGER, "dumpAnrStateLocked()");
+                synchronized (mService.mGlobalLock) {
+                    mService.saveANRStateLocked(activity, windowState, reason);
+                    mService.mAtmService.saveANRState(activity, reason);
+                }
+            } finally {
+                Trace.traceEnd(Trace.TRACE_TAG_ACTIVITY_MANAGER);
+            }
+        });
+    }
+```
+
+结果保存在 `WMS.saveANRStateLocked`（`WindowManagerService.java:7146`，dump 窗口层级）与 `ATMS.saveANRState`（`ActivityTaskManagerService.java:5625`，dump Activity 栈），供后续 `dumpsys` 输出，不进 traces 文件。
+
+#### 3.8.3 从 WM 到 AMS
+
+归因后若只有 pid，走 `mService.mAmInternal`（`ActivityManagerInternal`，非 ATMS.LocalService）：
+
+```195:196:services/core/java/com/android/server/wm/AnrController.java
+        } else {
+            mService.mAmInternal.inputDispatchingTimedOut(pid, aboveSystem, timeoutRecord);
+        }
+```
+
+AMS 的 `LocalService` 只是转发：
+
+```19307:19321:services/core/java/com/android/server/am/ActivityManagerService.java
+        @Override
+        public long inputDispatchingTimedOut(int pid, boolean aboveSystem,
+                TimeoutRecord timeoutRecord) {
+            return ActivityManagerService.this.inputDispatchingTimedOut(pid, aboveSystem,
+                    timeoutRecord);
+        }
+
+        @Override
+        public boolean inputDispatchingTimedOut(Object proc, String activityShortComponentName,
+                ApplicationInfo aInfo, String parentShortComponentName, Object parentProc,
+                boolean aboveSystem, TimeoutRecord timeoutRecord) {
+            return ActivityManagerService.this.inputDispatchingTimedOut((ProcessRecord) proc,
+                    activityShortComponentName, aInfo, parentShortComponentName,
+                    (WindowProcessController) parentProc, aboveSystem, timeoutRecord);
+        }
+```
+
+两个重载分别对应「按 pid 归因」（`AMS:20035`，返回下一次超时毫秒数，供 native 决定是否中止分发）与「按 ProcessRecord 归因」（`AMS:20059`）。后者的前置判定与上报见 3.1 节引文（`AMS:20073-20087`）。
+
+#### 3.8.4 版本对照与订正
+
+| 环节 | Android 9 及更早 | Android 15（本仓库） |
+|---|---|---|
+| 上报方式 | `mHandler.post(() -> mAppErrors.appNotResponding(...))` | `mAnrHelper.appNotResponding(proc, ..., timeoutRecord, isContinuousAnr=true)` |
+| 处理主体 | `AppErrors.appNotResponding` | **`ProcessErrorStateRecord.appNotResponding`**；`AppErrors` 已无该方法，仅保留 `handleShowAnrUi` 等 UI 逻辑 |
+| 归因 | 主要是 process 粒度 | `wm/AnrController` 支持 window token / pid / app 三级归因，并修正 pending focus 归因 |
+| 超时描述 | String annotation | `TimeoutRecord`（含 kind、endUptimeMillis、LatencyTracker、expired timer） |
+
+`isContinuousAnr = true` 是输入类 ANR 的硬编码传参（`AMS:20087`），区别于广播/Service 等一次性超时，表示「输入仍在持续无响应」。
+
+#### 3.8.5 精校结论
+
+用户给出的调用链整体准确，六处需订正：其一，JNI 层签名是 `notifyWindowUnresponsive(IBinder, int pid, boolean isPidValid, String)`，pid 以 `OptionalInt` 传递；其二，`InputManagerCallback` 会把 reason 包装成 `TimeoutRecord`，后续各环节传递的都是 `TimeoutRecord` 而非 String；其三，无聚焦窗口分支走 `notifyAppUnresponsive`（应用级），不走 window 级入口；其四，`dumpAnrStateLocked` 实为 `dumpAnrStateAsync`，异步执行于 FgThread，不在同步调用栈上，且位于归因之后；其五，`mService.mAmInternal` 是 `ActivityManagerInternal`（AMS 的 LocalService），不是 ATMS.LocalService；其六，Android 9 的 `mAppErrors.appNotResponding` 分支在 Android 15 已不存在，处理主体迁移到了 `ProcessErrorStateRecord`。
+
 ---
 
 ## 四、TimeoutRecord 与 AnrTimer：ANR 的「元数据」与「闹钟」
@@ -709,7 +1007,7 @@ traces 目录固定为 `/data/anr`，正式文件名 `anr_yyyy-MM-dd-HH-mm-ss-SS
 
 ## 十一、局限性
 
-本工作区未检出 ART 运行时、native InputDispatcher、`IInputConstants.aidl` 与 `android_os_Debug.cpp`，因此「SIGQUIT → SignalCatcher → `ThreadList::DumpForSigQuit`」这一段与输入超时 5000ms 的具体常量值来自 AOSP 上游语义而非本地源码取证。`AnrTimer` 的内部实现（native timer、`Flags.anrTimerServiceEnabled` 开关状态）也未逐行展开。`platform_frameworks_native` 与 `platform_system_core`（含 debuggerd）中的抓栈后端同样需要另行核对。
+本工作区已检出 `platform_frameworks_native/services/inputflinger/dispatcher/InputDispatcher.cpp`，3.8 节的 native 链路为本地源码逐行取证，包括 `DEFAULT_INPUT_DISPATCHING_TIMEOUT` 的定义（`InputDispatcher.cpp:138-142`）。仍缺失的部分是：`IInputConstants.aidl`（`UNMULTIPLIED_DEFAULT_DISPATCHING_TIMEOUT_MILLIS` 的字面值 5000 未在仓库内找到，由该常量经 `HwTimeoutMultiplier()` 缩放后使用）、ART 运行时（`art/runtime/signal_catcher.cc`）与 `framework15/core/jni/android_os_Debug.cpp`——因此「SIGQUIT → SignalCatcher → `ThreadList::DumpForSigQuit`」这一段来自 AOSP 上游语义而非本地取证。`AnrTimer` 的内部实现（native timer、`Flags.anrTimerServiceEnabled` 开关状态）亦未逐行展开。
 
 ## References
 
@@ -721,5 +1019,8 @@ traces 目录固定为 `/data/anr`，正式文件名 `anr_yyyy-MM-dd-HH-mm-ss-SS
 6. [AOSP frameworks/base — ActivityManagerService.java](https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java)
 7. [AOSP frameworks/base — ActiveServices.java](https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/services/core/java/com/android/server/am/ActiveServices.java)
 8. [AOSP frameworks/base — BroadcastQueueModernImpl.java](https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/services/core/java/com/android/server/am/BroadcastQueueModernImpl.java)
-9. [Android Developers — ANR 诊断与诊断指南](https://developer.android.com/topic/performance/vitals/anr)
-10. [Android Developers — ActivityManagerConstants / DeviceConfig](https://developer.android.com/reference/android/provider/DeviceConfig)
+9. [AOSP frameworks/native — InputDispatcher.cpp](https://cs.android.com/android/platform/superproject/main/+/main:frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp)
+10. [AOSP frameworks/base — InputManagerCallback.java](https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/services/core/java/com/android/server/wm/InputManagerCallback.java)
+11. [AOSP frameworks/base — InputManagerService.java](https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/services/core/java/com/android/server/input/InputManagerService.java)
+12. [Android Developers — ANR 诊断与诊断指南](https://developer.android.com/topic/performance/vitals/anr)
+13. [Android Developers — ActivityManagerConstants / DeviceConfig](https://developer.android.com/reference/android/provider/DeviceConfig)
